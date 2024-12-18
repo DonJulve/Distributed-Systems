@@ -1,0 +1,160 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: raft-service
+  labels:
+    app: rep
+spec:
+  clusterIP: None
+  selector:      # tiene que coincidir con label definido en pod de StatefulSet
+    app: rep  # Para dar de alta automaticamente en DNS a los PODS ligados
+  ports:
+  - port: 6000
+    name: servidor-port
+    protocol: TCP
+    targetPort: 6000
+
+---
+kind: StatefulSet
+apiVersion: apps/v1
+metadata:
+  name: raft
+spec:
+  serviceName: raft-service
+  replicas: 3
+  podManagementPolicy: Parallel   # por defecto seria OrderedReady (secuencial)
+  selector:
+    matchLabels:
+      app: rep    # tiene que corresponder a .spec.template.metadata.labels
+  template:
+    metadata:
+      labels:
+        app: rep
+    spec:
+      terminationGracePeriodSeconds: 10
+      initContainers:
+      - name: wait-for-barrier
+        image: busybox  # Using a lightweight image to wait for Barrier service
+        command:
+        - sh
+        - -c
+        - |
+          # Wait until Barrier service is reachable on port 8000
+          until nc -zv barrier-service.default.svc.cluster.local 8000; do
+            echo "Waiting for Barrier service to be ready..."
+            sleep 2
+          done
+          echo "Barrier service is up!"
+      containers:
+      - name: servidor
+        image: localhost:5001/srvraft:latest
+        env:
+        - name: MISUBDOMINIODNS
+          value: raft-service.default.svc.cluster.local
+        - name: MINOMBREPOD		# primera replica r-0, segunda r-1, etc
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: BARRIER_SERVICE_DNS  # DNS of the Barrier service
+          value: barrier-0.barrier-service.default.svc.cluster.local:8000
+        command:
+        - srvraft
+        - $(MINOMBREPOD)
+        - $(BARRIER_SERVICE_DNS)
+        - raft-0.raft-service.default.svc.cluster.local:6000
+        - raft-1.raft-service.default.svc.cluster.local:6000
+        - raft-2.raft-service.default.svc.cluster.local:6000
+        ports:
+        - containerPort: 6000
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: barrier-config
+data:
+  config.txt: |
+    barrier-0.barrier-service.default.svc.cluster.local:8000
+    raft-0.raft-service.default.svc.cluster.local:6000
+    raft-1.raft-service.default.svc.cluster.local:6000
+    raft-2.raft-service.default.svc.cluster.local:6000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: barrier
+spec:
+  serviceName: barrier-service
+  replicas: 1  # Only one barrier node
+  selector:
+    matchLabels:
+      app: barrier
+  template:
+    metadata:
+      labels:
+        app: barrier
+    spec:
+      containers:
+      - name: barrier-node
+        image: localhost:5001/barrier:latest  # Your Barrier node container image
+        env:
+        - name: MISUBDOMINIODNS
+          value: barrier-service.default.svc.cluster.local
+        - name: MINOMBREPOD		# primera replica r-0, segunda r-1, etc
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        command:
+        - barrier
+        - /etc/barrier/config.txt
+        - "1"
+        - "RUN"
+        volumeMounts:
+        - name: barrier-config-volume
+          mountPath: /etc/barrier/config.txt # Mount the ConfigMap file here
+          subPath: config.txt  # Use only the file, not the whole directory
+        ports:
+        - containerPort: 8000  # Barrier service port
+      volumes:
+      - name: barrier-config-volume
+        configMap:
+          name: barrier-config  # Reference the ConfigMap
+        
+---
+# Service for the Barrier Node
+apiVersion: v1
+kind: Service
+metadata:
+  name: barrier-service
+spec:
+  selector:
+    app: barrier
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cliente
+spec:
+  initContainers:
+    - name: wait-for-raft
+      image: busybox
+      command:
+        - sh
+        - -c
+        - |
+          until nc -zv raft-service.default.svc.cluster.local 6000; do
+            echo "Waiting for raft service to be ready..."
+            sleep 2
+          done
+          echo "Raft service is up!"
+  restartPolicy: OnFailure
+  containers:
+    - name: cliente
+      image: localhost:5001/cltraft:latest
+      command:
+        - /usr/local/bin/cliente
+      ports:
+        - containerPort: 7000
